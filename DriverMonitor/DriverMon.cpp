@@ -1,10 +1,12 @@
 #include "pch.h"
 #include <ntddstor.h>
 #include <ntddscsi.h>
-#include <srb.h>
-#include <scsi.h> 
-#include <srbhelper.h>
+//#include <storport.h>
+//#include <srb.h>
+//#include <scsi.h> 
 #include <nvme.h>
+#include <srbhelper.h>
+//#include <nvme.h>
 #include "DriverMon.h"
 #include "CyclicBuffer.h"
 #include "SpinLock.h"
@@ -21,7 +23,12 @@ NTSTATUS CompleteRequest(PIRP Irp, NTSTATUS status = STATUS_SUCCESS, ULONG_PTR I
 NTSTATUS AddDriver(PCWSTR driverName, PVOID* driverObject);
 NTSTATUS RemoveDriver(PVOID DriverObject);
 NTSTATUS RemoveDriver(int index);
-NTSTATUS DriverMonGenericDispatch(PDEVICE_OBJECT, PIRP);
+
+//NTSTATUS DriverMonGenericDispatch(PDEVICE_OBJECT, PIRP);
+
+NTSTATUS HookDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+NTSTATUS HookInternalDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+
 NTSTATUS OnIrpCompleted(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID context);
 NTSTATUS GetDataFromIrp(PDEVICE_OBJECT Deviceobject, PIRP Irp, PIO_STACK_LOCATION stack, IrpMajorCode code, PVOID buffer, ULONG size, bool output = false);
 void GenericDriverUnload(PDRIVER_OBJECT DriverObject);
@@ -370,17 +377,33 @@ NTSTATUS AddDriver(PCWSTR driverName, PVOID* driverObject) {
 
 	::wcscpy_s(globals.Drivers[index].DriverName, L"\\Driver\\stornvme");
 
-	for (int i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++) {
-		globals.Drivers[index].MajorFunction[i] = static_cast<PDRIVER_DISPATCH>(
-			InterlockedExchangePointer((PVOID*)&TargetDriver->MajorFunction[i], DriverMonGenericDispatch));
-	}
+	//for (int i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++) {
+	//	globals.Drivers[index].MajorFunction[i] = static_cast<PDRIVER_DISPATCH>(
+	//		InterlockedExchangePointer((PVOID*)&TargetDriver->MajorFunction[i], DriverMonGenericDispatch));
+	//}
+
+	globals.IsMonitoring = TRUE;
+
+	globals.Drivers[index].MajorFunction[IRP_MJ_DEVICE_CONTROL] = static_cast<PDRIVER_DISPATCH>(
+		InterlockedExchangePointer((PVOID*)&TargetDriver->MajorFunction[IRP_MJ_DEVICE_CONTROL], HookDeviceIoControl));
+
+	globals.Drivers[index].MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = static_cast<PDRIVER_DISPATCH>(
+		InterlockedExchangePointer((PVOID*)&TargetDriver->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL], HookInternalDeviceIoControl));
 
 	globals.Drivers[index].DriverUnload = static_cast<PDRIVER_UNLOAD>(InterlockedExchangePointer((PVOID*)&TargetDriver->DriverUnload, GenericDriverUnload));
 	globals.Drivers[index].DriverObject = TargetDriver;
+	globals.Drivers[index].DeviceObject = TargetDevice;
+
 	++globals.Count;
 	*driverObject = TargetDriver;
 
-	globals.IsMonitoring = TRUE;
+	globals.ReferenceCount = 1;
+
+	KeInitializeEvent(
+		&globals.StopEvent,
+		NotificationEvent, 
+		FALSE              
+	);
 
 	DbgPrint("Success add stornvme\n");
 
@@ -399,34 +422,186 @@ NTSTATUS RemoveDriver(PVOID DriverObject) {
 
 NTSTATUS RemoveDriver(int i) {
 	auto& driver = globals.Drivers[i];
-	for (int j = 0; j <= IRP_MJ_MAXIMUM_FUNCTION; j++) {
-		InterlockedExchangePointer((PVOID*)&driver.DriverObject->MajorFunction[j], driver.MajorFunction[j]);
+	//for (int j = 0; j <= IRP_MJ_MAXIMUM_FUNCTION; j++) {
+		//InterlockedExchangePointer((PVOID*)&driver.DriverObject->MajorFunction[j], driver.MajorFunction[j]);
+	//}
+
+	//LARGE_INTEGER timeout;
+	//timeout.QuadPart = -10 * 1000 * 1000;
+	
+	globals.IsMonitoring = FALSE;
+
+	if (InterlockedDecrement(&globals.ReferenceCount) > 0) {
+		KeWaitForSingleObject(&globals.StopEvent, Executive, KernelMode, FALSE, nullptr);
 	}
+
+	InterlockedExchangePointer((PVOID*)&driver.DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL], driver.MajorFunction[IRP_MJ_DEVICE_CONTROL]);
+	InterlockedExchangePointer((PVOID*)&driver.DriverObject->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL], driver.MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL]);
+
 	InterlockedExchangePointer((PVOID*)&driver.DriverUnload, driver.DriverUnload);
 
 	globals.Count--;
-	ObDereferenceObject(driver.DriverObject);
+	//ObDereferenceObject(driver.DriverObject);
 	driver.DriverObject = nullptr;
 
 	return STATUS_SUCCESS;
 }
 
 
-UCHAR ScsiToNVMe(UCHAR opcode) {
-	UCHAR ret;
-	
-	switch (opcode) {
-	case 0x42:
-		ret = 0x9;
-		break;
-	case 0x1B:
-		ret = 0x9;
-	
-	
-	
+NTSTATUS HookDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+
+	if (globals.IsMonitoring == FALSE) {
+		KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+		return  STATUS_DEVICE_REMOVED;
 	}
-	return ret;
+
+	InterlockedIncrement(&globals.ReferenceCount);
+
+	auto driver = DeviceObject->DriverObject;
+	auto stack = IoGetCurrentIrpStackLocation(Irp);
+
+	if (globals.Drivers[0].DeviceObject != DeviceObject) {
+		auto status =  globals.Drivers[0].MajorFunction[stack->MajorFunction](DeviceObject, Irp);
+		if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
+			KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+		}
+
+		return status;
+	}
+
+	if (globals.Drivers[0].DriverObject != driver) {
+		NT_ASSERT(false);
+		if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
+			KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+		}
+		return  STATUS_SUCCESS;
+	}
+
+	ULONG ioctl = stack->Parameters.DeviceIoControl.IoControlCode;
+
+	if (ioctl == IOCTL_SCSI_PASS_THROUGH) {
+		DbgPrint("IOCTL_SCSI_PASS_THROUGH\n");
+	}else if (ioctl == IOCTL_SCSI_PASS_THROUGH_DIRECT) {
+		DbgPrint("IOCTL_SCSI_PASS_THROUGH_DIRECT\n");
+	}
+	else if (ioctl == IOCTL_STORAGE_PROTOCOL_COMMAND) {
+		DbgPrint("IOCTL_STORAGE_PROTOCOL_COMMAND\n");
+	}
+	else if (ioctl == IOCTL_STORAGE_QUERY_PROPERTY) {
+		DbgPrint("IOCTL_STORAGE_QUERY_PROPERTY\n");
+
+		PSTORAGE_PROPERTY_QUERY query = (PSTORAGE_PROPERTY_QUERY)Irp->AssociatedIrp.SystemBuffer;
+		ULONG inputBufferLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+		if (query != nullptr && inputBufferLength >= sizeof(STORAGE_PROPERTY_QUERY)) {
+			if (query->PropertyId == StorageAdapterProtocolSpecificProperty && query->QueryType == PropertyStandardQuery) {
+				PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = (PSTORAGE_PROTOCOL_SPECIFIC_DATA)query->AdditionalParameters;
+				if (protocolData->ProtocolType == ProtocolTypeNvme) {
+					switch (protocolData->DataType) {
+					case NVMeDataTypeIdentify:
+						DbgPrint("NVMeDataTypeIdentify\n");
+
+						break;
+
+					case NVMeDataTypeLogPage:
+						DbgPrint("NVMeDataTypeLogPage\n");
+
+						break;
+
+					case NVMeDataTypeLogPageEx:
+						DbgPrint("NVMeDataTypeLogPageEx\n");
+
+						break;
+
+					case NVMeDataTypeFeature:
+						DbgPrint("NVMeDataTypeFeature\n");
+
+						break;
+
+					case NVMeDataTypeUnknown:
+						DbgPrint("NVMeDataTypeUnknown\n");
+						break;
+
+					default:
+						DbgPrint("NVMeDataTypeUnknown\n");
+						break;
+					}
+					
+				}
+
+			}
+		}
+	}
+	else {
+		DbgPrint("OTHER_IOCTL\n");
+
+	}
+
+	auto status =  globals.Drivers[0].MajorFunction[stack->MajorFunction](DeviceObject, Irp);
+
+	if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
+		KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+	}
+
+	return status;
 }
+
+
+NTSTATUS HookInternalDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+
+	if (globals.IsMonitoring == FALSE) {
+		KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+		return  STATUS_DEVICE_REMOVED;
+	}
+
+	InterlockedIncrement(&globals.ReferenceCount);
+
+	auto driver = DeviceObject->DriverObject;
+	auto stack = IoGetCurrentIrpStackLocation(Irp);
+
+	if (globals.Drivers[0].DeviceObject != DeviceObject) {
+		auto status = globals.Drivers[0].MajorFunction[stack->MajorFunction](DeviceObject, Irp);
+		if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
+			KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+		}
+
+		return status;
+	}
+
+	if (globals.Drivers[0].DriverObject != driver) {
+		NT_ASSERT(false);
+		if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
+			KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+		}
+		return  STATUS_SUCCESS;
+	}
+
+	PVOID   pAnySrb = stack->Parameters.Scsi.Srb;
+	if (pAnySrb != nullptr)
+	{
+		UCHAR func = SrbGetSrbFunction(pAnySrb);
+		if (func == SRB_FUNCTION_STORAGE_REQUEST_BLOCK)
+		{
+			DbgPrint("SRB_FUNCTION_STORAGE_REQUEST_BLOCK\n");
+		}
+		else if (func == SRB_FUNCTION_EXECUTE_SCSI) {
+			DbgPrint("SRB_FUNCTION_STORAGE_REQUEST_BLOCK\n");
+		}
+		else {
+			DbgPrint("OTHER_SRB_FUNCTION\n");
+
+		}
+	}
+
+	auto status = globals.Drivers[0].MajorFunction[stack->MajorFunction](DeviceObject, Irp);
+
+	if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
+		KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+	}
+
+	return status;
+}
+
+#if 0
 
 NTSTATUS DriverMonGenericDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	auto driver = DeviceObject->DriverObject;
@@ -518,18 +693,33 @@ NTSTATUS DriverMonGenericDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 						break;
 
 					case IrpMajorCode::INTERNAL_DEVICE_CONTROL:	// 0xf  
-						PSTORAGE_REQUEST_BLOCK   pSrb = (PSTORAGE_REQUEST_BLOCK)stack->Parameters.Scsi.Srb;
-						if (pSrb != nullptr && pSrb->Signature == SRB_SIGNATURE)
+						PVOID   pAnySrb = stack->Parameters.Scsi.Srb;
+						if (pAnySrb != nullptr )
 						{
-							UCHAR func = SrbGetSrbFunction(pSrb);
-							if (func == SRB_FUNCTION_EXECUTE_SCSI)
+							UCHAR func = SrbGetSrbFunction(pAnySrb);
+							if ( func == SRB_FUNCTION_STORAGE_REQUEST_BLOCK)
 							{
+								PSTORAGE_REQUEST_BLOCK pSrb = (PSTORAGE_REQUEST_BLOCK)pAnySrb;
+
+								if (pSrb->Length >= sizeof(STORAGE_REQUEST_BLOCK)) {
+									PSTORAGE_PROTOCOL_COMMAND protocolCommand = (PSTORAGE_PROTOCOL_COMMAND)pSrb->DataBuffer;
+									if (protocolCommand != NULL && pSrb->DataTransferLength >= sizeof(STORAGE_PROTOCOL_COMMAND)) {
+	
+
+									}
+								}
+
+							}
+							else if (func == SRB_FUNCTION_EXECUTE_SCSI) {
+								PSCSI_REQUEST_BLOCK pSrb = (PSCSI_REQUEST_BLOCK)pAnySrb;
 								PCDB pcdb = SrbGetCdb(pSrb);
 								UCHAR  cdbLen = SrbGetCdbLength(pSrb);
 								if (pcdb != nullptr && cdbLen)
 								{
-									info->scsi_opcode = pcdb->CDB6GENERIC.OperationCode;
+									//info->scsi_opcode = pcdb->CDB6GENERIC.OperationCode;
+									info->scsi_opcode = pcdb->AsByte[0];
 								}
+							
 							}
 						}
 			
@@ -642,6 +832,8 @@ NTSTATUS DriverMonGenericDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	return STATUS_SUCCESS;
 }
 
+#endif
+
 NTSTATUS OnIrpCompleted(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID context) {
 	int index;
 	auto originalCompletion = static_cast<PIO_COMPLETION_ROUTINE>(globals.IrpCompletionTable->Find(Irp, &index));
@@ -723,6 +915,7 @@ NTSTATUS OnIrpCompleted(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID context) {
 }
 
 void RemoveAllDrivers() {
+
 	for (int i = 0; i < MaxMonitoredDrivers; ++i) {
 		if (globals.Drivers[i].DriverObject)
 			RemoveDriver(i);

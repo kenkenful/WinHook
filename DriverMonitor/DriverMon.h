@@ -43,7 +43,8 @@ struct MonitoredDriver {
 	PDRIVER_DISPATCH MajorFunction[IRP_MJ_MAXIMUM_FUNCTION + 1];
 	PDRIVER_OBJECT DriverObject;
 	PDRIVER_UNLOAD DriverUnload;
-	PDEVICE_OBJECT DeviceObjects[4];
+	PDEVICE_OBJECT DeviceObject;
+	//IO_REMOVE_LOCK RemoveLock;
 };
 
 const int MaxMonitoredDrivers = 1;
@@ -58,6 +59,8 @@ struct DriverMonGlobals {
 	PKEVENT NotifyEvent;
 	short Count;
 	bool IsMonitoring;
+	LONG ReferenceCount;
+	KEVENT StopEvent;
 };
 
 extern DriverMonGlobals globals;
