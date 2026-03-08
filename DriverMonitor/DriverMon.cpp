@@ -4,6 +4,8 @@
 //#include <storport.h>
 //#include <srb.h>
 //#include <scsi.h> 
+
+
 #include <nvme.h>
 #include <srbhelper.h>
 //#include <nvme.h>
@@ -175,7 +177,7 @@ NTSTATUS DriverMonDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 				break;
 			}
 
-			// BDF��n���悤�ɂ���
+			// BDF��n���悤�ɂ���
 			status = AddDriver(driverName, (PVOID*)Irp->AssociatedIrp.SystemBuffer);
 			if (NT_SUCCESS(status)) {
 				information = sizeof(PVOID);
@@ -189,7 +191,7 @@ NTSTATUS DriverMonDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 				break;
 			}
 
-			// BDF��n���悤�ɂ���
+			// BDF��n���悤�ɂ���
 			status = RemoveDriver(*(PVOID*)Irp->AssociatedIrp.SystemBuffer);
 			break;
 
@@ -243,7 +245,7 @@ NTSTATUS AddDriver(PCWSTR driverName, PVOID* driverObject) {
 	}
 
 
-	//  �����Ńh���C�o�[�I�u�W�F�N�g��T���Ă���B
+	//  �����Ńh���C�o�[�I�u�W�F�N�g��T���Ă���B
 #if 0
 	UNICODE_STRING name;
 	RtlInitUnicodeString(&name, driverName);
@@ -455,6 +457,9 @@ NTSTATUS HookDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 		return  STATUS_DEVICE_REMOVED;
 	}
 
+	DbgPrint("mikami \n");
+
+
 	InterlockedIncrement(&globals.ReferenceCount);
 
 	auto driver = DeviceObject->DriverObject;
@@ -492,9 +497,16 @@ NTSTATUS HookDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
 		PSTORAGE_PROPERTY_QUERY query = (PSTORAGE_PROPERTY_QUERY)Irp->AssociatedIrp.SystemBuffer;
 		ULONG inputBufferLength = stack->Parameters.DeviceIoControl.InputBufferLength;
+
 		if (query != nullptr && inputBufferLength >= sizeof(STORAGE_PROPERTY_QUERY)) {
-			if (query->PropertyId == StorageAdapterProtocolSpecificProperty && query->QueryType == PropertyStandardQuery) {
+			DbgPrint("%d\n", __LINE__);
+
+			
+			if ((query->PropertyId == StorageAdapterProtocolSpecificProperty || query->PropertyId == StorageDeviceProtocolSpecificProperty  ) && query->QueryType == PropertyStandardQuery) {
 				PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = (PSTORAGE_PROTOCOL_SPECIFIC_DATA)query->AdditionalParameters;
+				DbgPrint("%d\n", __LINE__);
+
+
 				if (protocolData->ProtocolType == ProtocolTypeNvme) {
 					switch (protocolData->DataType) {
 					case NVMeDataTypeIdentify:
@@ -545,8 +557,326 @@ NTSTATUS HookDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	return status;
 }
 
+NTSTATUS OnRequestComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context) {
+	if (Irp->PendingReturned) {
+		IoMarkIrpPending(Irp);
+	}
+
+	// ここで応答値をフィルタリング
+	// 例: status = Irp->IoStatus.Status;
+	// 例: バッファ = Irp->AssociatedIrp.SystemBuffer;
+
+	do
+	{
+		PIO_STACK_LOCATION  irpStack;
+
+		// https://docs.microsoft.com/en-us/windows-hardware/drivers/storage/storage-filter-driver-s-dispatch-routines
+		irpStack = IoGetCurrentIrpStackLocation(Irp);
+		if (irpStack == NULL)
+		{
+			DbgPrint("irpStack is null\n");
+			break;
+		}
+
+		//
+		// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/content/wdm/ns-wdm-_io_stack_location
+		// 
+		if (irpStack->MajorFunction != IRP_MJ_SCSI) {
+			DbgPrint("%s Major 0x%x minor 0x%x \n", __FUNCTION__, irpStack->MajorFunction, irpStack->MinorFunction);
+			break;
+		}
+
+
+		PSCSI_REQUEST_BLOCK srb;
+		PUCHAR cdb;
+		UCHAR cdbLength;
+		UCHAR scsiStatus;
+		PUCHAR senseData;
+		UCHAR senseDataLength;
+
+
+		srb = irpStack->Parameters.Scsi.Srb;
+		if (srb == NULL)
+		{
+			DbgPrint("srb is null\n");
+			break;
+		}
+
+		// Could be STORAGE_REQUEST_BLOCK, checking the function field
+		// https://www.osr.com/nt-insider/2014-issue4/win7-vs-win8-storport-miniports/
+		//
+		if (srb->Function == SRB_FUNCTION_EXECUTE_SCSI)
+		{
+			cdb = srb->Cdb;
+			cdbLength = srb->CdbLength;
+			senseData = (PUCHAR)srb->SenseInfoBuffer;
+			senseDataLength = srb->SenseInfoBufferLength;
+			scsiStatus = srb->ScsiStatus;
+
+			if (cdbLength == 0 || cdbLength > 16)
+			{
+				DbgPrint("CDB %2d bytes, abnormal!!\n", cdbLength);
+				break;
+			}
+
+			DbgPrint("SRB_FUNCTION_EXECUTE_SCSI complete  buffer %p, senseInfoLength %x, status %x \n", srb->SenseInfoBuffer, srb->SenseInfoBufferLength, srb->ScsiStatus);
+
+			//SaveCdbToRingBufEx(cdb, cdbLength, senseData, senseDataLength, CompletionParams->IoStatus.Status, scsiStatus);
+		}
+		else if (srb->Function == SRB_FUNCTION_STORAGE_REQUEST_BLOCK)
+		{
+
+			PSTORAGE_REQUEST_BLOCK  storRequestBlock = (PSTORAGE_REQUEST_BLOCK)srb;
+
+			DbgPrint("NumSrbExData %d \n", storRequestBlock->NumSrbExData);
+
+			for (ULONG srbExDataIndex = 0; srbExDataIndex < storRequestBlock->NumSrbExData; srbExDataIndex++)
+			{
+
+				PSRBEX_DATA srbExDataTmp = (PSRBEX_DATA)((PUCHAR)storRequestBlock + storRequestBlock->SrbExDataOffset[srbExDataIndex]);
+				DbgPrint("SrbExType %x \n", srbExDataTmp->Type);
+
+				if (srbExDataTmp->Type == SrbExDataTypeScsiCdb16)
+				{
+					PSRBEX_DATA_SCSI_CDB16 srbEx = (PSRBEX_DATA_SCSI_CDB16)srbExDataTmp;
+
+					cdb = srbEx->Cdb;
+					cdbLength = srbEx->CdbLength;
+					senseData = (PUCHAR)srbEx->SenseInfoBuffer;
+					senseDataLength = srbEx->SenseInfoBufferLength;
+					scsiStatus = srb->ScsiStatus;
+
+					DbgPrint("scsi status %x, sensebuf %p, senseLength %d\n", srbEx->ScsiStatus, srbEx->SenseInfoBuffer, srbEx->SenseInfoBufferLength);
+
+
+
+
+#if 1
+					//PIRP Irp = WdfRequestWdmGetIrp(Request);
+
+					if (storRequestBlock != NULL && Irp->MdlAddress != NULL) {
+						// 1. IRP に紐付く MDL から安全なシステムアドレスを取得
+						// 完了ルーチン(DISPATCH_LEVEL)なので、MdlMappingNoExecute | HighPagePriority を推奨
+						PVOID systemAddress = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, HighPagePriority);
+
+						if (systemAddress != NULL) {
+							ULONG dataLen = storRequestBlock->DataTransferLength;
+							ULONG printLen = (dataLen < 16) ? dataLen : 16;
+
+							DbgPrint("DataBuffer Content (First %d bytes):", printLen);
+							for (ULONG i = 0; i < printLen; ++i) {
+								DbgPrint(" %02X", *((PUCHAR)systemAddress + i));
+							}
+							DbgPrint("\n");
+						}
+						else {
+							DbgPrint("Failed to map MDL to system address.\n");
+						}
+					}
+
+#else
+
+					PMDL mdl = (PMDL)storRequestBlock->DataBuffer;
+					PVOID systemAddress = NULL;
+
+					if (mdl != NULL) {
+						// MDL からカーネル空間で安全な仮想アドレスを取得
+						systemAddress = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
+					}
+
+					if (systemAddress != NULL) {
+						ULONG dataLen = MmGetMdlByteCount(mdl);
+						ULONG printLen = (dataLen < 16) ? dataLen : 16; // 最大16バイト出力
+
+						DbgPrint("DataBuffer Content (First %d bytes):", printLen);
+						for (ULONG i = 0; i < printLen; ++i) {
+							DbgPrint(" %02X", *((PUCHAR)systemAddress + i));
+						}
+						DbgPrint("\n");
+					}
+					else {
+						DbgPrint("DataBuffer/MDL is NULL or mapping failed.\n");
+					}
+
+
+#endif
+
+					if (cdbLength == 0 || cdbLength > 16)
+					{
+						DbgPrint("CDB %2d bytes, abnormal!!\n", cdbLength);
+						break;
+					}
+				}
+				else if (srbExDataTmp->Type == SrbExDataTypeScsiCdb32)
+				{
+					PSRBEX_DATA_SCSI_CDB32 srbEx = (PSRBEX_DATA_SCSI_CDB32)srbExDataTmp;
+
+					cdb = srbEx->Cdb;
+					cdbLength = srbEx->CdbLength;
+					senseData = (PUCHAR)srbEx->SenseInfoBuffer;
+					senseDataLength = srbEx->SenseInfoBufferLength;
+					scsiStatus = srb->ScsiStatus;
+
+					DbgPrint("scsi status %x, sensebuf %p, senseLength %d\n", srbEx->ScsiStatus, srbEx->SenseInfoBuffer, srbEx->SenseInfoBufferLength);
+
+
+#if 1
+					//PIRP Irp = WdfRequestWdmGetIrp(Request);
+
+					if (storRequestBlock != NULL && Irp->MdlAddress != NULL) {
+						PVOID systemAddress = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, HighPagePriority);
+
+						if (systemAddress != NULL) {
+							ULONG dataLen = storRequestBlock->DataTransferLength;
+							ULONG printLen = (dataLen < 16) ? dataLen : 16;
+
+							DbgPrint("DataBuffer Content (First %d bytes):", printLen);
+							for (ULONG i = 0; i < printLen; ++i) {
+								DbgPrint(" %02X", *((PUCHAR)systemAddress + i));
+							}
+							DbgPrint("\n");
+						}
+						else {
+							DbgPrint("Failed to map MDL to system address.\n");
+						}
+					}
+
+#else
+
+					PMDL mdl = (PMDL)storRequestBlock->DataBuffer;
+					PVOID systemAddress = NULL;
+
+					if (mdl != NULL) {
+						// MDL からカーネル空間で安全な仮想アドレスを取得
+						systemAddress = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
+					}
+
+					if (systemAddress != NULL) {
+						ULONG dataLen = MmGetMdlByteCount(mdl);
+						ULONG printLen = (dataLen < 16) ? dataLen : 16; // 最大16バイト出力
+
+						DbgPrint("DataBuffer Content (First %d bytes):", printLen);
+						for (ULONG i = 0; i < printLen; ++i) {
+							DbgPrint(" %02X", *((PUCHAR)systemAddress + i));
+						}
+						DbgPrint("\n");
+					}
+					else {
+						DbgPrint("DataBuffer/MDL is NULL or mapping failed.\n");
+					}
+
+
+#endif
+
+
+
+					if (cdbLength == 0 || cdbLength > 32)
+					{
+						DbgPrint("CDB %2d bytes, abnormal!!\n", cdbLength);
+						break;
+					}
+				}
+				else if (srbExDataTmp->Type == SrbExDataTypeScsiCdbVar)
+				{
+					PSRBEX_DATA_SCSI_CDB_VAR srbEx = (PSRBEX_DATA_SCSI_CDB_VAR)srbExDataTmp;
+
+					cdb = srbEx->Cdb;
+					cdbLength = (srbEx->CdbLength > 255) ? 255 : (UCHAR)srbEx->CdbLength;
+					senseData = (PUCHAR)srbEx->SenseInfoBuffer;
+					senseDataLength = srbEx->SenseInfoBufferLength;
+					scsiStatus = srb->ScsiStatus;
+
+					DbgPrint("scsi status %x, sensebuf %p, senseLength %d\n", srbEx->ScsiStatus, srbEx->SenseInfoBuffer, srbEx->SenseInfoBufferLength);
+
+
+#if 1
+					if (storRequestBlock != NULL && Irp->MdlAddress != NULL) {
+						PVOID systemAddress = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, HighPagePriority);
+
+						if (systemAddress != NULL) {
+							ULONG dataLen = storRequestBlock->DataTransferLength;
+							ULONG printLen = (dataLen < 16) ? dataLen : 16;
+
+							DbgPrint("DataBuffer Content (First %d bytes):", printLen);
+							for (ULONG i = 0; i < printLen; ++i) {
+								DbgPrint(" %02X", *((PUCHAR)systemAddress + i));
+							}
+							DbgPrint("\n");
+						}
+						else {
+							DbgPrint("Failed to map MDL to system address.\n");
+						}
+					}
+
+#else
+
+					PMDL mdl = (PMDL)storRequestBlock->DataBuffer;
+					PVOID systemAddress = NULL;
+
+					if (mdl != NULL) {
+						// MDL からカーネル空間で安全な仮想アドレスを取得
+						systemAddress = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
+					}
+
+					if (systemAddress != NULL) {
+						ULONG dataLen = MmGetMdlByteCount(mdl);
+						ULONG printLen = (dataLen < 16) ? dataLen : 16; // 最大16バイト出力
+
+						DbgPrint("DataBuffer Content (First %d bytes):", printLen);
+						for (ULONG i = 0; i < printLen; ++i) {
+							DbgPrint(" %02X", *((PUCHAR)systemAddress + i));
+						}
+						DbgPrint("\n");
+					}
+					else {
+						DbgPrint("DataBuffer/MDL is NULL or mapping failed.\n");
+					}
+
+
+#endif
+
+
+
+
+					if (cdbLength == 0)
+					{
+						DbgPrint("CDB %2d bytes, abnormal!!\n", cdbLength);
+						break;
+					}
+				}
+				else {
+					continue;
+				}
+
+				//SaveCdbToRingBufEx(cdb, cdbLength, senseData, senseDataLength, CompletionParams->IoStatus.Status, scsiStatus);
+				// SaveCdbToRingBuf(cdb, cdbLength);
+			}
+		}
+		else
+		{
+			DbgPrint("srb function is 0x%x, not supported\n", srb->Function);
+			break;
+		}
+	} while (FALSE);
+
+
+
+
+
+
+	// 参照カウントのデクリメント処理などをここで行う
+	if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
+		KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+	}
+
+	return Irp->IoStatus.Status;
+}
+
 
 NTSTATUS HookInternalDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+
+	DbgPrint("HookInternalDeviceIoControl \n");
+
 
 	if (globals.IsMonitoring == FALSE) {
 		KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
@@ -558,14 +888,22 @@ NTSTATUS HookInternalDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 	auto driver = DeviceObject->DriverObject;
 	auto stack = IoGetCurrentIrpStackLocation(Irp);
 
-	if (globals.Drivers[0].DeviceObject != DeviceObject) {
-		auto status = globals.Drivers[0].MajorFunction[stack->MajorFunction](DeviceObject, Irp);
-		if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
-			KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
-		}
+//	DbgPrint("path1 \n");
 
-		return status;
-	}
+	//if (globals.Drivers[0].DeviceObject != DeviceObject) {
+
+		//DbgPrint("path100 \n");
+
+		//auto status = globals.Drivers[0].MajorFunction[stack->MajorFunction](DeviceObject, Irp);
+		//if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
+			//KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+		//}
+
+		//return status;
+	//}
+
+//	DbgPrint("path2 \n");
+
 
 	if (globals.Drivers[0].DriverObject != driver) {
 		NT_ASSERT(false);
@@ -575,30 +913,25 @@ NTSTATUS HookInternalDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 		return  STATUS_SUCCESS;
 	}
 
-	PVOID   pAnySrb = stack->Parameters.Scsi.Srb;
-	if (pAnySrb != nullptr)
-	{
-		UCHAR func = SrbGetSrbFunction(pAnySrb);
-		if (func == SRB_FUNCTION_STORAGE_REQUEST_BLOCK)
-		{
-			DbgPrint("SRB_FUNCTION_STORAGE_REQUEST_BLOCK\n");
-		}
-		else if (func == SRB_FUNCTION_EXECUTE_SCSI) {
-			DbgPrint("SRB_FUNCTION_STORAGE_REQUEST_BLOCK\n");
-		}
-		else {
-			DbgPrint("OTHER_SRB_FUNCTION\n");
+	//DbgPrint("path3 \n");
 
-		}
-	}
+
+
 
 	auto status = globals.Drivers[0].MajorFunction[stack->MajorFunction](DeviceObject, Irp);
 
-	if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
-		KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
-	}
 
-	return status;
+	IoCopyCurrentIrpStackLocationToNext(Irp);
+	IoSetCompletionRoutine(Irp, OnRequestComplete, nullptr, TRUE, TRUE, TRUE);
+
+	// 次のドライバへ渡す（完了ルーチンで参照カウントを下げるため、ここでは下げない）
+	return IoCallDriver(globals.Drivers[0].DeviceObject, Irp);
+
+	//if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
+		//KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
+	//}
+
+	//return status;
 }
 
 #if 0
@@ -621,7 +954,7 @@ NTSTATUS DriverMonGenericDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 
 			info = static_cast<IrpArrivedInfo*>(ExAllocatePoolWithTag(NonPagedPool, MaxDataSize + sizeof(IrpArrivedInfo), DRIVER_TAG));
 
-			// �����ŋ��ʂ̏�������
+			// �����ŋ��ʂ̏�������
 			if (info) {
 				info->Type = DataItemType::IrpArrived;
 				KeQuerySystemTime((PLARGE_INTEGER)&info->Time);
