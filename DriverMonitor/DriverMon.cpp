@@ -860,10 +860,6 @@ NTSTATUS OnRequestComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
 	} while (FALSE);
 
 
-
-
-
-
 	// 参照カウントのデクリメント処理などをここで行う
 	if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
 		KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
@@ -913,25 +909,19 @@ NTSTATUS HookInternalDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 		return  STATUS_SUCCESS;
 	}
 
-	//DbgPrint("path3 \n");
-
-
-
-
-	auto status = globals.Drivers[0].MajorFunction[stack->MajorFunction](DeviceObject, Irp);
-
 
 	IoCopyCurrentIrpStackLocationToNext(Irp);
 	IoSetCompletionRoutine(Irp, OnRequestComplete, nullptr, TRUE, TRUE, TRUE);
 
-	// 次のドライバへ渡す（完了ルーチンで参照カウントを下げるため、ここでは下げない）
-	return IoCallDriver(globals.Drivers[0].DeviceObject, Irp);
+	IoSetNextIrpStackLocation(Irp);
+
+	auto status = globals.Drivers[0].MajorFunction[stack->MajorFunction](DeviceObject, Irp);
 
 	//if (InterlockedDecrement(&globals.ReferenceCount) == 0) {
 		//KeSetEvent(&globals.StopEvent, IO_NO_INCREMENT, FALSE);
 	//}
 
-	//return status;
+	return status;
 }
 
 #if 0
